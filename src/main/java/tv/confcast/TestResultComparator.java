@@ -4,13 +4,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVRecord;
 import org.apache.commons.io.FilenameUtils;
-import org.apache.commons.math3.stat.descriptive.rank.Median;
+import org.apache.commons.math3.stat.descriptive.rank.Percentile;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.NotNull;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Parameters;
+import tv.helper.CellWithLink;
 import tv.helper.ExcelHelper;
+import tv.helper.HeaderCellParams;
 
 import java.io.File;
 import java.io.FileReader;
@@ -20,9 +22,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.Callable;
-import java.util.function.Supplier;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 
 @Command(
         name = "compare-jmeter",
@@ -45,7 +44,7 @@ public class TestResultComparator implements Callable<Integer> {
     private static LinkedHashMap<String, UrlStat> loadResults(
             @NotNull Path taskFile
     ) throws Exception {
-        LinkedHashMap<String, List<Integer>> latencyMap = new LinkedHashMap<>();
+        LinkedHashMap<String, List<UrlLatency>> latencyMap = new LinkedHashMap<>();
         try (Reader in = new FileReader(taskFile.toFile())) {
             Iterable<CSVRecord> records = CSVFormat.DEFAULT
                     .withFirstRecordAsHeader()
@@ -61,28 +60,38 @@ public class TestResultComparator implements Callable<Integer> {
                     continue;
                 }
                 latencyMap.computeIfAbsent(label, k -> new ArrayList<>())
-                        .add(latency);
+                        .add(new UrlLatency(url, latency));
             }
         }
         LinkedHashMap<String, UrlStat> result = new LinkedHashMap<>();
-        for (Map.Entry<String, List<Integer>> entry : latencyMap.entrySet()) {
-            Supplier<IntStream> streamProvider = () -> entry.getValue().stream()
-                    .mapToInt(Integer::intValue);
-            int average = (int) streamProvider.get()
+        Percentile percentileComputer = new Percentile();
+        for (Map.Entry<String, List<UrlLatency>> entry : latencyMap.entrySet()) {
+            int average = (int) entry.getValue().stream()
+                    .mapToInt(UrlLatency::latency)
                     .average()
                     .orElseThrow();
-            int median = (int) new Median().evaluate(
-                    entry.getValue().stream()
-                            .mapToDouble(Integer::doubleValue)
-                            .toArray()
+            final UrlLatency[] values = entry.getValue().stream()
+                    .sorted()
+                    .toArray(UrlLatency[]::new);
+            percentileComputer.setData(Arrays
+                    .stream(values)
+                    .mapToDouble(UrlLatency::latency)
+                    .toArray()
             );
-            int min = streamProvider.get().min().orElseThrow();
-            int max = streamProvider.get().max().orElseThrow();
+            UrlLatency min = values[0];
+            UrlLatency max = values[values.length - 1];
+            Map<Integer, UrlLatency> percentiles = new HashMap<>();
+            for (int percentile : UrlStat.PERCENTILES) {
+                final int computedPercentile = (int) percentileComputer.evaluate(percentile);
+                final int foundPos = Arrays.binarySearch(values, new UrlLatency("", computedPercentile));
+                percentiles.put(percentile, values[Math.abs(foundPos)]);
+            }
+
             result.put(entry.getKey(), new UrlStat(
                     min,
                     max,
                     average,
-                    median
+                    percentiles
             ));
         }
         return result;
@@ -106,41 +115,82 @@ public class TestResultComparator implements Callable<Integer> {
         return result;
     }
 
+    private static void addColumns(
+            @NotNull List<Object> row,
+            int oldValue,
+            int newValue
+    ) {
+        row.add(oldValue);
+        row.add(newValue);
+        row.add(newValue - oldValue);
+        row.add((newValue - oldValue) * 100 / oldValue);
+    }
+
+    private static void addColumns(
+            @NotNull List<Object> row,
+           @NotNull UrlLatency oldValue,
+           @NotNull UrlLatency newValue
+    ) {
+        addColumns(row, oldValue.latency(), newValue.latency());
+        row.set(row.size() - 4, new CellWithLink(oldValue.url(), oldValue.latency()));
+        row.set(row.size() - 3, new CellWithLink(newValue.url(), newValue.latency()));
+    }
+
     private static void writeXlsx(
             @NotNull LinkedHashMap<String, UrlComparison> pageComparisonMap,
             @NotNull Path outputFile,
             @NotNull String sheetName
     ) throws Exception {
+        Collection<ArrayList<Object>> rows = new ArrayList<>();
+        for (var entry : pageComparisonMap.entrySet()) {
+            ArrayList<Object> row = new ArrayList<>();
+            row.add(entry.getKey());
+            addColumns(
+                    row,
+                    entry.getValue().getReference().getAverage(),
+                    entry.getValue().getChanged().getAverage()
+            );
+            for (var percentile : UrlStat.PERCENTILES) {
+                addColumns(
+                        row,
+                        entry.getValue().getReference().getPercentiles().get(percentile),
+                        entry.getValue().getChanged().getPercentiles().get(percentile)
+                );
+            }
+            rows.add(row);
+        }
+        List<String> columnHeaders = new ArrayList<>();
+        columnHeaders.add("Page");
+
+        List<HeaderCellParams> firstHeaderRow = new ArrayList<>();
+        List<HeaderCellParams> secondHeaderRow = new ArrayList<>();
+        firstHeaderRow.add(new HeaderCellParams("Page", 1, 2));
+        secondHeaderRow.add(null);
+
+        List<String> comparisonHeaderTitles = new ArrayList<>();
+        comparisonHeaderTitles.add("Average");
+
+        for (int percentile : UrlStat.PERCENTILES) {
+            comparisonHeaderTitles.add(percentile + "%-percentile");
+        }
+
+        for (var title : comparisonHeaderTitles) {
+            firstHeaderRow.add(new HeaderCellParams(title, 4, 1));
+            for (int i = 0; i < 3; ++i) {
+                firstHeaderRow.add(null);
+            }
+            secondHeaderRow.add(new HeaderCellParams("Before, ms"));
+            secondHeaderRow.add(new HeaderCellParams("After, ms"));
+            secondHeaderRow.add(new HeaderCellParams("Change, ms"));
+            secondHeaderRow.add(new HeaderCellParams("Change, %"));
+        }
+
+        List<List<HeaderCellParams>> headerRows = List.of(firstHeaderRow, secondHeaderRow);
+
         byte[] xlsBytes = ExcelHelper.generateExcelWorkbook(
                 sheetName,
-                pageComparisonMap.entrySet().stream()
-                        .map(entry -> {
-                            ArrayList<Object> result = new ArrayList<>();
-                            result.add(entry.getKey());
-                            int oldAverage = entry.getValue().getReference().getAverage();
-                            result.add(oldAverage);
-                            int newAverage = entry.getValue().getChanged().getAverage();
-                            result.add(newAverage);
-                            result.add(newAverage - oldAverage);
-                            result.add((newAverage - oldAverage) * 100 / oldAverage);
-                            int oldMedian = entry.getValue().getReference().getMedian();
-                            result.add(oldMedian);
-                            int newMedian = entry.getValue().getChanged().getMedian();
-                            result.add(newMedian);
-                            result.add(newMedian - oldMedian);
-                            result.add((newMedian - oldMedian) * 100 / oldMedian);
-                            return result;
-                        })
-                        .collect(Collectors.toList()),
-                "Page",
-                "average before, ms",
-                "average after, ms",
-                "average change, ms",
-                "average change, %",
-                "median before, ms",
-                "median after, ms",
-                "median change, ms",
-                "median change, %"
+                rows,
+                headerRows
         );
         Files.write(outputFile, xlsBytes);
     }
